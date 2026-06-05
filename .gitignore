@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+
+# Large data artifacts (broad rules)
+**/FETCH_*/
+**/data/
+**/daily/
+**/weekly/
+**/monthly/
+**/WEEKLY_OPTIMIZATION_DATA/
+
+# Generated reports/outputs
+**/reports/
+STOCKS/all_stocks_adjusted_returns.xlsx
