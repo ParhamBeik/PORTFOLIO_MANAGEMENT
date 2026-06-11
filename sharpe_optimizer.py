@@ -491,41 +491,42 @@ class SharpeRatioOptimizerEnhanced:
         verbose: bool = False
     ) -> Tuple[np.ndarray, float]:
         """
-        Step 7.3: Intelligent (Heuristic) Start
-        
+        Step 7.3: Intelligent (Heuristic) Start – enhanced with Sharpe‑proportional weights.
+
         Prepare candidate initial vectors:
-        1. Equal weights
-        2. Maximum return asset
-        3. Minimum variance portfolio
-        4. One random start
-        
-        Run SLSQP from each and keep best.
-        
+            1. Equal weights
+            2. Maximum return asset
+            3. Minimum variance portfolio
+            4. Sharpe‑proportional weights (new)
+            5. One random start
+
+        Run SLSQP from each and keep the best.
+
         Args:
             mu: Expected returns
             sigma: Covariance matrix
-            min_return: Minimum return constraint
-            max_risk: Maximum risk constraint
+            min_return: Minimum return constraint (optional)
+            max_risk: Maximum risk constraint (optional)
             verbose: Print progress
-            
+
         Returns:
             Tuple of (best_weights, best_sharpe)
         """
         candidates = []
         candidate_names = []
-        
+
         # 1. Equal weights
         candidates.append(np.ones(self.n_assets) / self.n_assets)
         candidate_names.append("Equal Weight")
-        
+
         # 2. Maximum return asset
         max_idx = np.argmax(mu)
         w_max_return = np.zeros(self.n_assets)
         w_max_return[max_idx] = 1.0
         candidates.append(w_max_return)
         candidate_names.append("Max Return Asset")
-        
-        # 3. Minimum variance portfolio
+
+        # 3. Minimum variance portfolio (fallback to random if singular)
         try:
             sigma_inv = np.linalg.inv(sigma)
             ones = np.ones(self.n_assets)
@@ -535,29 +536,46 @@ class SharpeRatioOptimizerEnhanced:
             candidates.append(w_min_var)
             candidate_names.append("Minimum Variance")
         except np.linalg.LinAlgError:
+            # If covariance is singular, use a random start instead
             candidates.append(np.random.dirichlet(np.ones(self.n_assets)))
             candidate_names.append("Random (Sigma singular)")
-        
-        # 4. Random
+
+        # 4. Sharpe‑proportional weights (new, built directly here)
+        #    Individual asset Sharpe = (mu_i - r_f) / sqrt(sigma_ii)
+        asset_vols = np.sqrt(np.diag(sigma))
+        asset_vols = np.maximum(asset_vols, 1e-8)  # avoid division by zero
+        asset_sharpes = (mu - self.risk_free_rate) / asset_vols
+        positive_sharpes = np.maximum(asset_sharpes, 0.0)  # ignore negative Sharpes
+
+        if np.sum(positive_sharpes) > 0:
+            w_sharpe = positive_sharpes / np.sum(positive_sharpes)
+        else:
+            # Fallback: equal weights if no positive Sharpe
+            w_sharpe = np.ones(self.n_assets) / self.n_assets
+
+        candidates.append(w_sharpe)
+        candidate_names.append("Sharpe‑Proportional")
+
+        # 5. Random (final candidate for additional exploration)
         candidates.append(np.random.dirichlet(np.ones(self.n_assets)))
         candidate_names.append("Random")
-        
+
         best_weights = None
         best_sharpe = -np.inf
-        
+
         for candidate, name in zip(candidates, candidate_names):
             weights, sharpe = self._run_slsqp(candidate, mu, sigma, min_return, max_risk)
-            
+
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_weights = weights
-            
+
             if verbose:
                 print(f"  {name:25} → Sharpe = {sharpe:.6f}")
-        
+
         if best_weights is None:
             raise ValueError("All smart-start candidates failed")
-        
+
         return best_weights, best_sharpe
     
     def _pso_step(
