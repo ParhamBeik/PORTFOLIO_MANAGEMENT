@@ -13,13 +13,15 @@ Features:
   * Multi-start optimization
   * Intelligent/Smart initialization
   * Hybrid Particle Swarm Optimization + SLSQP
+- Iteration tracking and timing for each strategy
 - Comprehensive utility methods and testing support
 """
 
 import numpy as np
 import pandas as pd
-from typing import Union, Tuple, Dict, Optional, Literal, List
+from typing import Union, Tuple, Dict, Optional, Literal, List, Callable
 from scipy.optimize import minimize
+import time
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -37,7 +39,7 @@ class SharpeRatioOptimizerEnhanced:
     5. Constraint functions
     6. Core SLSQP runner
     7. Local optima avoidance strategies
-    8. Main run function
+    8. Main run function with optional iteration tracking and timing
     9. Utility methods
     10. Testing and validation
     """
@@ -337,13 +339,13 @@ class SharpeRatioOptimizerEnhanced:
         if min_return is not None:
             constraints.append({
                 'type': 'ineq',
-                'fun': lambda w: self._return_constraint(w, mu, min_return)
+                'fun': lambda w, mu=mu, min_r=min_return: self._return_constraint(w, mu, min_r)
             })
         
         if max_risk is not None:
             constraints.append({
                 'type': 'ineq',
-                'fun': lambda w: self._risk_constraint(w, sigma, max_risk)
+                'fun': lambda w, sigma=sigma, max_r=max_risk: self._risk_constraint(w, sigma, max_r)
             })
         
         return constraints
@@ -358,8 +360,9 @@ class SharpeRatioOptimizerEnhanced:
         min_return: Optional[float] = None,
         max_risk: Optional[float] = None,
         precision: float = 1e-6,
-        max_iter: int = 1000
-    ) -> Tuple[Optional[np.ndarray], float]:
+        max_iter: int = 1000,
+        callback: Optional[Callable] = None
+    ) -> Tuple[Optional[np.ndarray], float, Optional[List[np.ndarray]]]:
         """
         Step 6: Core SLSQP Runner
         
@@ -373,9 +376,10 @@ class SharpeRatioOptimizerEnhanced:
             max_risk: Maximum risk constraint (or None)
             precision: Convergence tolerance
             max_iter: Maximum iterations
+            callback: Optional callback function that receives the current weights at each iteration
             
         Returns:
-            Tuple of (optimal_weights, sharpe_ratio) or (None, -inf) if failed
+            Tuple of (optimal_weights, sharpe_ratio, iteration_weights) or (None, -inf, None) if failed
         """
         # Build constraints
         constraints = self._build_constraints(mu, sigma, min_return, max_risk)
@@ -394,15 +398,16 @@ class SharpeRatioOptimizerEnhanced:
             method='SLSQP',
             bounds=self.bounds,
             constraints=constraints,
-            options=options
+            options=options,
+            callback=callback
         )
         
         if result.success:
             weights = result.x / np.sum(result.x)  # Ensure sum to 1
             sharpe = -result.fun
-            return weights, sharpe
+            return weights, sharpe, None  # iteration history is captured via callback if needed
         else:
-            return None, -np.inf
+            return None, -np.inf, None
     
     # ========== Step 7: Local Optima Avoidance Strategies ==========
     
@@ -411,8 +416,9 @@ class SharpeRatioOptimizerEnhanced:
         mu: np.ndarray,
         sigma: np.ndarray,
         min_return: Optional[float] = None,
-        max_risk: Optional[float] = None
-    ) -> Tuple[np.ndarray, float]:
+        max_risk: Optional[float] = None,
+        track_history: bool = False
+    ) -> Tuple[np.ndarray, float, Dict]:
         """
         Strategy 1: Basic SLSQP (Single Run)
         
@@ -423,17 +429,31 @@ class SharpeRatioOptimizerEnhanced:
             sigma: Covariance matrix
             min_return: Minimum return constraint
             max_risk: Maximum risk constraint
+            track_history: If True, record iteration weights
             
         Returns:
-            Tuple of (optimal_weights, sharpe_ratio)
+            Tuple of (optimal_weights, sharpe_ratio, info_dict)
+            info_dict contains 'iteration_weights' (if tracked) and 'time_seconds'
         """
+        start_time = time.time()
         x0 = np.ones(self.n_assets) / self.n_assets
-        weights, sharpe = self._run_slsqp(x0, mu, sigma, min_return, max_risk)
+        iteration_weights = []
+        
+        def callback(xk):
+            if track_history:
+                iteration_weights.append(xk.copy())
+        
+        weights, sharpe, _ = self._run_slsqp(x0, mu, sigma, min_return, max_risk, callback=callback if track_history else None)
+        elapsed = time.time() - start_time
         
         if weights is None:
             raise ValueError("SLSQP optimization failed from initial guess")
         
-        return weights, sharpe
+        info = {'time_seconds': elapsed}
+        if track_history:
+            info['iteration_weights'] = iteration_weights
+        
+        return weights, sharpe, info
     
     def _multi_start(
         self,
@@ -442,8 +462,9 @@ class SharpeRatioOptimizerEnhanced:
         sigma: np.ndarray,
         min_return: Optional[float] = None,
         max_risk: Optional[float] = None,
-        verbose: bool = False
-    ) -> Tuple[np.ndarray, float]:
+        verbose: bool = False,
+        track_history: bool = False
+    ) -> Tuple[np.ndarray, float, Dict]:
         """
         Step 7.2: Multiple Random Starts (Multi-start)
         
@@ -457,22 +478,46 @@ class SharpeRatioOptimizerEnhanced:
             min_return: Minimum return constraint
             max_risk: Maximum risk constraint
             verbose: Print progress
+            track_history: If True, record per-start details and iteration histories
             
         Returns:
-            Tuple of (best_weights, best_sharpe)
+            Tuple of (best_weights, best_sharpe, info_dict)
+            info_dict contains 'starts_details' (list of dicts with start index, initial weights,
+            final weights, sharpe, time) and 'time_seconds' total.
         """
+        start_time_total = time.time()
         best_weights = None
         best_sharpe = -np.inf
+        starts_details = []
         
         for i in range(n_starts):
+            start_time_start = time.time()
             # Generate random weights via Dirichlet
             x0 = np.random.dirichlet(np.ones(self.n_assets))
             
-            weights, sharpe = self._run_slsqp(x0, mu, sigma, min_return, max_risk)
+            iteration_weights = []
+            def callback(xk):
+                if track_history:
+                    iteration_weights.append(xk.copy())
+            
+            weights, sharpe, _ = self._run_slsqp(x0, mu, sigma, min_return, max_risk, 
+                                                 callback=callback if track_history else None)
+            elapsed_start = time.time() - start_time_start
             
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_weights = weights
+            
+            start_info = {
+                'start_index': i,
+                'initial_weights': x0,
+                'final_weights': weights,
+                'sharpe': sharpe,
+                'time_seconds': elapsed_start
+            }
+            if track_history:
+                start_info['iteration_weights'] = iteration_weights
+            starts_details.append(start_info)
             
             if verbose and (i + 1) % max(1, n_starts // 5) == 0:
                 print(f"  Multi-start {i+1}/{n_starts}: Best Sharpe = {best_sharpe:.6f}")
@@ -480,7 +525,12 @@ class SharpeRatioOptimizerEnhanced:
         if best_weights is None:
             raise ValueError("All multi-start attempts failed")
         
-        return best_weights, best_sharpe
+        total_elapsed = time.time() - start_time_total
+        info = {
+            'time_seconds': total_elapsed,
+            'starts_details': starts_details
+        }
+        return best_weights, best_sharpe, info
     
     def _smart_start(
         self,
@@ -488,45 +538,51 @@ class SharpeRatioOptimizerEnhanced:
         sigma: np.ndarray,
         min_return: Optional[float] = None,
         max_risk: Optional[float] = None,
-        verbose: bool = False
-    ) -> Tuple[np.ndarray, float]:
+        verbose: bool = False,
+        track_history: bool = False
+    ) -> Tuple[np.ndarray, float, Dict]:
         """
         Step 7.3: Intelligent (Heuristic) Start – enhanced with Sharpe‑proportional weights.
-
+        
         Prepare candidate initial vectors:
             1. Equal weights
             2. Maximum return asset
             3. Minimum variance portfolio
             4. Sharpe‑proportional weights (new)
-            5. One random start
-
+            (Random candidate removed as requested)
+        
         Run SLSQP from each and keep the best.
-
+        
         Args:
             mu: Expected returns
             sigma: Covariance matrix
             min_return: Minimum return constraint (optional)
             max_risk: Maximum risk constraint (optional)
             verbose: Print progress
-
+            track_history: If True, record per-candidate iteration histories
+            
         Returns:
-            Tuple of (best_weights, best_sharpe)
+            Tuple of (best_weights, best_sharpe, info_dict)
+            info_dict contains 'candidates_details' (list of dicts with candidate name,
+            initial weights, final weights, sharpe, time, iteration_weights if tracked)
+            and 'time_seconds' total.
         """
+        start_time_total = time.time()
         candidates = []
         candidate_names = []
-
+        
         # 1. Equal weights
         candidates.append(np.ones(self.n_assets) / self.n_assets)
         candidate_names.append("Equal Weight")
-
+        
         # 2. Maximum return asset
         max_idx = np.argmax(mu)
         w_max_return = np.zeros(self.n_assets)
         w_max_return[max_idx] = 1.0
         candidates.append(w_max_return)
         candidate_names.append("Max Return Asset")
-
-        # 3. Minimum variance portfolio (fallback to random if singular)
+        
+        # 3. Minimum variance portfolio (fallback to equal weights if singular)
         try:
             sigma_inv = np.linalg.inv(sigma)
             ones = np.ones(self.n_assets)
@@ -536,47 +592,68 @@ class SharpeRatioOptimizerEnhanced:
             candidates.append(w_min_var)
             candidate_names.append("Minimum Variance")
         except np.linalg.LinAlgError:
-            # If covariance is singular, use a random start instead
-            candidates.append(np.random.dirichlet(np.ones(self.n_assets)))
-            candidate_names.append("Random (Sigma singular)")
-
-        # 4. Sharpe‑proportional weights (new, built directly here)
-        #    Individual asset Sharpe = (mu_i - r_f) / sqrt(sigma_ii)
+            # If covariance is singular, use equal weights as fallback
+            candidates.append(np.ones(self.n_assets) / self.n_assets)
+            candidate_names.append("Minimum Variance (fallback to equal)")
+        
+        # 4. Sharpe‑proportional weights
         asset_vols = np.sqrt(np.diag(sigma))
         asset_vols = np.maximum(asset_vols, 1e-8)  # avoid division by zero
         asset_sharpes = (mu - self.risk_free_rate) / asset_vols
         positive_sharpes = np.maximum(asset_sharpes, 0.0)  # ignore negative Sharpes
-
+        
         if np.sum(positive_sharpes) > 0:
             w_sharpe = positive_sharpes / np.sum(positive_sharpes)
         else:
             # Fallback: equal weights if no positive Sharpe
             w_sharpe = np.ones(self.n_assets) / self.n_assets
-
+        
         candidates.append(w_sharpe)
         candidate_names.append("Sharpe‑Proportional")
-
-        # 5. Random (final candidate for additional exploration)
-        candidates.append(np.random.dirichlet(np.ones(self.n_assets)))
-        candidate_names.append("Random")
-
+        
         best_weights = None
         best_sharpe = -np.inf
-
+        candidates_details = []
+        
         for candidate, name in zip(candidates, candidate_names):
-            weights, sharpe = self._run_slsqp(candidate, mu, sigma, min_return, max_risk)
-
+            start_time_candidate = time.time()
+            iteration_weights = []
+            
+            def callback(xk):
+                if track_history:
+                    iteration_weights.append(xk.copy())
+            
+            weights, sharpe, _ = self._run_slsqp(candidate, mu, sigma, min_return, max_risk,
+                                                 callback=callback if track_history else None)
+            elapsed_candidate = time.time() - start_time_candidate
+            
+            candidate_info = {
+                'name': name,
+                'initial_weights': candidate,
+                'final_weights': weights,
+                'sharpe': sharpe,
+                'time_seconds': elapsed_candidate
+            }
+            if track_history:
+                candidate_info['iteration_weights'] = iteration_weights
+            candidates_details.append(candidate_info)
+            
             if sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_weights = weights
-
+            
             if verbose:
-                print(f"  {name:25} → Sharpe = {sharpe:.6f}")
-
+                print(f"  {name:25} → Sharpe = {sharpe:.6f} (time: {elapsed_candidate:.4f}s)")
+        
         if best_weights is None:
             raise ValueError("All smart-start candidates failed")
-
-        return best_weights, best_sharpe
+        
+        total_elapsed = time.time() - start_time_total
+        info = {
+            'time_seconds': total_elapsed,
+            'candidates_details': candidates_details
+        }
+        return best_weights, best_sharpe, info
     
     def _pso_step(
         self,
@@ -637,8 +714,9 @@ class SharpeRatioOptimizerEnhanced:
         max_risk: Optional[float] = None,
         n_particles: int = 30,
         n_iter: int = 50,
-        verbose: bool = False
-    ) -> Tuple[np.ndarray, float]:
+        verbose: bool = False,
+        track_history: bool = False
+    ) -> Tuple[np.ndarray, float, Dict]:
         """
         Step 7.4: Hybrid Metaheuristic + SLSQP
         
@@ -653,10 +731,13 @@ class SharpeRatioOptimizerEnhanced:
             n_particles: Number of PSO particles
             n_iter: Number of PSO iterations
             verbose: Print progress
+            track_history: If True, record PSO history (best weights per iteration) and SLSQP iteration history
             
         Returns:
-            Tuple of (final_weights, sharpe_ratio)
+            Tuple of (final_weights, sharpe_ratio, info_dict)
+            info_dict contains 'pso_history' (list of best weights per iteration) and 'refinement_info'
         """
+        start_time_total = time.time()
         # Phase 1: PSO Initialization
         positions = np.array([np.random.dirichlet(np.ones(self.n_assets)) 
                             for _ in range(n_particles)])
@@ -668,6 +749,10 @@ class SharpeRatioOptimizerEnhanced:
         global_best_position = best_positions[global_best_idx].copy()
         global_best_value = best_values[global_best_idx]
         
+        pso_history = []
+        if track_history:
+            pso_history.append(global_best_position.copy())
+        
         # Phase 1: PSO iterations
         for iteration in range(n_iter):
             positions, velocities, best_positions, global_best_position, global_best_value = \
@@ -676,20 +761,43 @@ class SharpeRatioOptimizerEnhanced:
                     best_values, global_best_value, mu, sigma
                 )
             
+            if track_history:
+                pso_history.append(global_best_position.copy())
+            
             if verbose and (iteration + 1) % max(1, n_iter // 5) == 0:
                 print(f"  PSO iteration {iteration+1}/{n_iter}: "
                       f"Best Sharpe = {-global_best_value:.6f}")
         
+        pso_time = time.time() - start_time_total
+        
         # Phase 2: Refine with SLSQP
-        weights, sharpe = self._run_slsqp(
-            global_best_position, mu, sigma, min_return, max_risk
+        start_refine = time.time()
+        refinement_iter_weights = []
+        def refine_callback(xk):
+            if track_history:
+                refinement_iter_weights.append(xk.copy())
+        
+        weights, sharpe, _ = self._run_slsqp(
+            global_best_position, mu, sigma, min_return, max_risk,
+            callback=refine_callback if track_history else None
         )
+        refine_time = time.time() - start_refine
         
         if weights is None:
             weights = global_best_position
             sharpe = -global_best_value
         
-        return weights, sharpe
+        total_elapsed = time.time() - start_time_total
+        info = {
+            'time_seconds': total_elapsed,
+            'pso_time_seconds': pso_time,
+            'refinement_time_seconds': refine_time,
+            'pso_history': pso_history if track_history else None
+        }
+        if track_history:
+            info['refinement_iteration_weights'] = refinement_iter_weights
+        
+        return weights, sharpe, info
     
     # ========== Step 8: Main Run Function ==========
     
@@ -702,6 +810,7 @@ class SharpeRatioOptimizerEnhanced:
         strategy: Literal['basic', 'multi_start', 'smart_start', 'hybrid'] = 'basic',
         random_seed: Optional[int] = None,
         verbose: bool = False,
+        track_history: bool = False,
         **strategy_kwargs
     ) -> Dict:
         """
@@ -710,7 +819,7 @@ class SharpeRatioOptimizerEnhanced:
         Single entry point that orchestrates everything:
         - Compute μ and Σ with user-selected method
         - Enforce chosen constraints
-        - Run chosen optimization strategy
+        - Run chosen optimization strategy with optional iteration tracking and timing
         
         Args:
             returns_method: 'simple' or 'exponential' for computing expected returns
@@ -720,6 +829,7 @@ class SharpeRatioOptimizerEnhanced:
             strategy: Optimization strategy: 'basic', 'multi_start', 'smart_start', 'hybrid'
             random_seed: Seed for reproducibility
             verbose: Print optimization progress
+            track_history: If True, record iteration-by-iteration weights and details (where applicable)
             **strategy_kwargs: Additional arguments for strategies:
                 - For 'multi_start': n_starts (default 10)
                 - For 'hybrid': n_particles (default 30), n_iter (default 50)
@@ -735,6 +845,8 @@ class SharpeRatioOptimizerEnhanced:
             - 'strategy': Strategy used
             - 'mu': Expected returns vector
             - 'sigma': Covariance matrix
+            - 'elapsed_time': Total optimization time (seconds)
+            - 'history': (if track_history) Detailed iteration history (structure depends on strategy)
         """
         
         if random_seed is not None:
@@ -773,34 +885,43 @@ class SharpeRatioOptimizerEnhanced:
             if strategy == 'basic':
                 if verbose:
                     print(f"Strategy: Basic SLSQP")
-                weights, sharpe = self._basic_slsqp(mu, sigma, min_return, max_risk)
+                weights, sharpe, info = self._basic_slsqp(mu, sigma, min_return, max_risk, track_history)
+                history = info.get('iteration_weights') if track_history else None
             
             elif strategy == 'multi_start':
                 n_starts = strategy_kwargs.get('n_starts', 10)
                 if verbose:
                     print(f"Strategy: Multi-Start ({n_starts} starts)")
-                weights, sharpe = self._multi_start(
-                    n_starts, mu, sigma, min_return, max_risk, verbose=verbose
+                weights, sharpe, info = self._multi_start(
+                    n_starts, mu, sigma, min_return, max_risk, verbose=verbose, track_history=track_history
                 )
+                history = info.get('starts_details') if track_history else None
             
             elif strategy == 'smart_start':
                 if verbose:
-                    print(f"Strategy: Smart Initialization")
-                weights, sharpe = self._smart_start(
-                    mu, sigma, min_return, max_risk, verbose=verbose
+                    print(f"Strategy: Smart Initialization (no random candidate)")
+                weights, sharpe, info = self._smart_start(
+                    mu, sigma, min_return, max_risk, verbose=verbose, track_history=track_history
                 )
+                history = info.get('candidates_details') if track_history else None
             
             elif strategy == 'hybrid':
                 n_particles = strategy_kwargs.get('n_particles', 30)
                 n_iter = strategy_kwargs.get('n_iter', 50)
                 if verbose:
                     print(f"Strategy: Hybrid PSO+SLSQP ({n_particles} particles, {n_iter} iter)")
-                weights, sharpe = self._hybrid(
-                    mu, sigma, min_return, max_risk, n_particles, n_iter, verbose=verbose
+                weights, sharpe, info = self._hybrid(
+                    mu, sigma, min_return, max_risk, n_particles, n_iter, verbose=verbose, track_history=track_history
                 )
+                history = {
+                    'pso_history': info.get('pso_history'),
+                    'refinement_iteration_weights': info.get('refinement_iteration_weights')
+                } if track_history else None
             
             else:
                 raise ValueError(f"Unknown strategy: {strategy}")
+            
+            elapsed_time = info['time_seconds']
             
             # Step 3: Compute final portfolio statistics
             portfolio_vars = self.calculate_variables(weights, mu, sigma)
@@ -808,6 +929,7 @@ class SharpeRatioOptimizerEnhanced:
             # Store results
             self.optimal_weights = weights
             self.optimal_sharpe = sharpe
+            self.last_run_info = info
             
             # Verify constraints
             valid = True
@@ -840,12 +962,13 @@ class SharpeRatioOptimizerEnhanced:
                 print(f"Optimal Sharpe Ratio: {sharpe:.6f}")
                 print(f"Expected Return: {portfolio_vars['return']:.6f}")
                 print(f"Portfolio Risk: {portfolio_vars['risk']:.6f}")
+                print(f"Elapsed time: {elapsed_time:.4f} seconds")
                 print(f"Status: {'✓ VALID' if valid else '✗ INVALID'}")
                 for msg in messages:
                     print(f"  {msg}")
                 print(f"{'='*70}\n")
             
-            return {
+            result = {
                 'weights': weights,
                 'return': portfolio_vars['return'],
                 'risk': portfolio_vars['risk'],
@@ -855,8 +978,14 @@ class SharpeRatioOptimizerEnhanced:
                 'strategy': strategy,
                 'mu': mu,
                 'sigma': sigma,
-                'asset_labels': self.raw_data_labels
+                'asset_labels': self.raw_data_labels,
+                'elapsed_time': elapsed_time
             }
+            
+            if track_history:
+                result['history'] = history
+            
+            return result
         
         except Exception as e:
             if verbose:
@@ -872,7 +1001,8 @@ class SharpeRatioOptimizerEnhanced:
                 'strategy': strategy,
                 'mu': None,
                 'sigma': None,
-                'asset_labels': self.raw_data_labels
+                'asset_labels': self.raw_data_labels,
+                'elapsed_time': None
             }
     
     # ========== Step 9: Utility Methods ==========
@@ -1116,5 +1246,6 @@ if __name__ == "__main__":
     print("Enhanced Sharpe Ratio Optimizer loaded successfully!")
     print("\nUsage:")
     print("  1. optimizer = SharpeRatioOptimizerEnhanced(data, risk_free_rate)")
-    print("  2. results = optimizer.run(strategy='multi_start')")
+    print("  2. results = optimizer.run(strategy='smart_start', track_history=True)")
     print("  3. print(optimizer.summary())")
+    print("  4. print(f\"Optimization took {results['elapsed_time']:.2f} seconds\")")
