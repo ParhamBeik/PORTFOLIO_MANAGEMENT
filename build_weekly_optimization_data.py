@@ -277,6 +277,28 @@ def calculate_asset_metrics(returns_series: pd.Series) -> Dict[str, float]:
     }
 
 
+def calculate_max_drawdown(prices: Iterable[Any]) -> float:
+    price_series = pd.Series(list(prices), dtype="float64").dropna()
+    price_series = price_series[price_series > 0]
+    if price_series.shape[0] < 2:
+        return 0.0
+
+    running_peak = price_series.cummax()
+    drawdowns = (price_series - running_peak) / running_peak
+    return float(drawdowns.min())
+
+
+def calculate_rolling_volatility(
+    returns_series: Iterable[Any],
+    window: int = 26,
+    periods_per_year: int = 52,
+) -> List[Optional[float]]:
+    series = pd.Series(list(returns_series), dtype="float64")
+    rolling = series.rolling(window=window, min_periods=window).std(ddof=1)
+    annualized = rolling * np.sqrt(periods_per_year)
+    return [json_number(value) for value in annualized]
+
+
 def calculate_covariance_matrix(returns_dataframe: pd.DataFrame) -> pd.DataFrame:
     returns_df = pd.DataFrame(returns_dataframe).apply(pd.to_numeric, errors="coerce")
     if returns_df.empty:
@@ -323,15 +345,53 @@ def process_adjusted_file(file_path: Path, output_dir: Path) -> Path:
 
     if weekly_df.empty:
         asset_metrics = {"expected_return": np.nan, "volatility": np.nan}
+        rolling_volatility: List[Optional[float]] = []
+        coverage_metrics = {
+            "weeks_available": 0,
+            "first_week": None,
+            "last_week": None,
+        }
+        liquidity_metrics = {
+            "average_weekly_volume": None,
+            "average_weekly_trade_value_toman": None,
+            "median_weekly_trade_value_toman": None,
+        }
+        risk_metrics = {"max_drawdown": None}
     else:
         non_zero_volume_log_returns = pd.to_numeric(
             weekly_df.loc[weekly_df["weekly_volume"] > 0, "log_return"],
             errors="coerce",
         )
         asset_metrics = calculate_asset_metrics(non_zero_volume_log_returns)
+        observed_weeks = weekly_df[weekly_df["weekly_volume"] > 0].copy()
+        if observed_weeks.empty:
+            observed_weeks = weekly_df.copy()
+
+        rolling_volatility = calculate_rolling_volatility(
+            pd.to_numeric(weekly_df["log_return"], errors="coerce")
+        )
+        trade_values = pd.to_numeric(
+            observed_weeks["weekly_trade_value_toman"], errors="coerce"
+        ).dropna()
+        volumes = pd.to_numeric(observed_weeks["weekly_volume"], errors="coerce").dropna()
+        closes = pd.to_numeric(weekly_df["close"], errors="coerce")
+
+        coverage_metrics = {
+            "weeks_available": int(len(weekly_df)),
+            "first_week": str(weekly_df.iloc[0]["week_start_date"]),
+            "last_week": str(weekly_df.iloc[-1]["week_start_date"]),
+        }
+        liquidity_metrics = {
+            "average_weekly_volume": json_number(volumes.mean()),
+            "average_weekly_trade_value_toman": json_number(trade_values.mean()),
+            "median_weekly_trade_value_toman": json_number(trade_values.median()),
+        }
+        risk_metrics = {
+            "max_drawdown": json_number(calculate_max_drawdown(closes)),
+        }
 
     weekly_json_rows: List[Dict[str, Any]] = []
-    for row in weekly_data:
+    for idx, row in enumerate(weekly_data):
         weekly_json_rows.append(
             {
                 "week_start_date": row["week_start_date"],
@@ -344,6 +404,7 @@ def process_adjusted_file(file_path: Path, output_dir: Path) -> Path:
                 "weekly_trade_value_toman": float(row["weekly_trade_value_toman"]),
                 "simple_return": json_number(row["simple_return"]),
                 "log_return": json_number(row["log_return"]),
+                "rolling_26w_volatility": rolling_volatility[idx],
             }
         )
 
@@ -351,9 +412,16 @@ def process_adjusted_file(file_path: Path, output_dir: Path) -> Path:
         "ticker": symbol,
         "industry": industry,
         "timeframe": "1W",
+        "metadata": {
+            "return_type": "log_return",
+            "calendar": "jalali",
+        },
         "metrics": {
             "annualized_expected_return": json_number(asset_metrics["expected_return"]),
             "annualized_volatility": json_number(asset_metrics["volatility"]),
+            "coverage": coverage_metrics,
+            "liquidity": liquidity_metrics,
+            "risk": risk_metrics,
         },
         "data": weekly_json_rows,
     }
@@ -386,6 +454,19 @@ def iter_with_progress(paths: List[Path]) -> Iterable[Path]:
     return tqdm(paths, total=len(paths), unit="file", desc="Processing")
 
 
+def clear_existing_weekly_json(output_dir: Path) -> int:
+    if not output_dir.exists():
+        return 0
+
+    deleted_count = 0
+    for file_path in output_dir.glob("*.json"):
+        if file_path.is_file():
+            file_path.unlink()
+            deleted_count += 1
+
+    return deleted_count
+
+
 def run(source_dir: Path, output_dir: Path) -> int:
     if not source_dir.exists():
         log_error(f"Source directory not found: {source_dir.resolve()}")
@@ -395,6 +476,9 @@ def run(source_dir: Path, output_dir: Path) -> int:
     log_info(f"Found {len(adjusted_files)} adjusted.json files.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    deleted_count = clear_existing_weekly_json(output_dir)
+    if deleted_count:
+        log_info(f"Deleted {deleted_count} old weekly JSON files from {output_dir.resolve()}.")
 
     success_count = 0
     failed_count = 0
@@ -428,10 +512,9 @@ def run(source_dir: Path, output_dir: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     script_dir = Path(__file__).resolve().parent
-    base_dir = script_dir.parent
 
-    default_source = base_dir / "data" / "FETCH_CANDLESTICK_DATA"
-    default_output = base_dir / "WEEKLY_OPTIMIZATION_DATA"
+    default_source = script_dir / "CANDLESTICKS" / "data" / "FETCH_CANDLESTICK_DATA"
+    default_output = script_dir / "WEEKLY_OPTIMIZATION_DATA"
 
     parser = argparse.ArgumentParser(
         description="Convert daily adjusted candlesticks to weekly Jalali candles with returns."
@@ -464,7 +547,10 @@ if __name__ == "__main__":
 __all__ = [
     "calculate_asset_metrics",
     "calculate_covariance_matrix",
+    "calculate_max_drawdown",
     "calculate_portfolio_metrics",
+    "calculate_rolling_volatility",
+    "clear_existing_weekly_json",
     "run",
     "main",
 ]

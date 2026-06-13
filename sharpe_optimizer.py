@@ -24,8 +24,6 @@ from scipy.optimize import minimize
 import time
 import warnings
 
-warnings.filterwarnings('ignore')
-
 
 class SharpeRatioOptimizerEnhanced:
     """
@@ -79,6 +77,8 @@ class SharpeRatioOptimizerEnhanced:
             data_array = raw_data.copy()
         else:
             raise TypeError("raw_data must be numpy array or pandas DataFrame")
+
+        self._validate_raw_data(data_array)
         
         self.raw_data = data_array
         self.risk_free_rate = risk_free_rate
@@ -93,6 +93,8 @@ class SharpeRatioOptimizerEnhanced:
             self.returns_matrix = self._prices_to_returns(data_array)
         else:
             self.returns_matrix = data_array.copy()
+
+        self._validate_returns_matrix(self.returns_matrix)
         
         # Store dimensions
         self.T, self.n_assets = self.returns_matrix.shape
@@ -106,6 +108,26 @@ class SharpeRatioOptimizerEnhanced:
         self.optimal_weights = None
         self.optimal_sharpe = None
         self.last_run_info = {}
+
+    @staticmethod
+    def _validate_raw_data(data: np.ndarray) -> None:
+        if data.ndim != 2:
+            raise ValueError("raw_data must be a 2D matrix with shape (time_periods, assets)")
+        if data.shape[0] == 0 or data.shape[1] == 0:
+            raise ValueError("raw_data must contain at least one row and one asset")
+        if not np.isfinite(data).all():
+            raise ValueError("raw_data contains NaN or infinite values")
+
+    @staticmethod
+    def _validate_returns_matrix(returns_matrix: np.ndarray) -> None:
+        if returns_matrix.ndim != 2:
+            raise ValueError("returns_matrix must be 2D")
+        if returns_matrix.shape[0] < 2:
+            raise ValueError("returns_matrix must contain at least two time periods")
+        if returns_matrix.shape[1] == 0:
+            raise ValueError("returns_matrix must contain at least one asset")
+        if not np.isfinite(returns_matrix).all():
+            raise ValueError("returns_matrix contains NaN or infinite values")
     
     @staticmethod
     def _detect_data_type(data: np.ndarray) -> str:
@@ -392,15 +414,17 @@ class SharpeRatioOptimizerEnhanced:
         }
         
         # Run optimization
-        result = minimize(
-            fun=lambda w: self._neg_sharpe(w, mu, sigma),
-            x0=x0,
-            method='SLSQP',
-            bounds=self.bounds,
-            constraints=constraints,
-            options=options,
-            callback=callback
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = minimize(
+                fun=lambda w: self._neg_sharpe(w, mu, sigma),
+                x0=x0,
+                method='SLSQP',
+                bounds=self.bounds,
+                constraints=constraints,
+                options=options,
+                callback=callback
+            )
         
         if result.success:
             weights = result.x / np.sum(result.x)  # Ensure sum to 1
@@ -938,6 +962,10 @@ class SharpeRatioOptimizerEnhanced:
             if not np.isclose(np.sum(weights), 1.0, atol=1e-6):
                 valid = False
                 messages.append(f"Sum of weights = {np.sum(weights):.8f} (not 1.0)")
+
+            if not np.isfinite(sharpe) or sharpe <= -1e9:
+                valid = False
+                messages.append("Sharpe ratio is not finite or portfolio risk is near zero")
             
             if min_return is not None:
                 actual_return = portfolio_vars['return']
@@ -1024,8 +1052,183 @@ class SharpeRatioOptimizerEnhanced:
         
         if len(lower) != self.n_assets or len(upper) != self.n_assets:
             raise ValueError("Bounds must have length n_assets")
+        if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)):
+            raise ValueError("Bounds must be finite")
+        if np.any(lower > upper):
+            raise ValueError("Each lower bound must be less than or equal to upper bound")
+        if np.sum(lower) > 1.0 + 1e-12 or np.sum(upper) < 1.0 - 1e-12:
+            raise ValueError("Bounds cannot satisfy the sum-of-weights constraint")
         
         self.bounds = list(zip(lower, upper))
+
+    def generate_efficient_frontier(
+        self,
+        n_portfolios: int = 100,
+        returns_method: Literal['simple', 'exponential'] = 'simple',
+        lambda_factor: Optional[float] = None,
+        random_seed: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Generate long-only portfolio variations for efficient-frontier visualization.
+
+        This method does not change the optimizer's main run() output. It reuses the
+        same expected-return and covariance estimates, then samples feasible
+        long-only portfolios on the simplex and reports their risk/return points.
+        """
+        if n_portfolios < 1:
+            raise ValueError("n_portfolios must be at least 1")
+        if random_seed is not None:
+            np.random.seed(random_seed)
+
+        if returns_method == 'simple':
+            mu, sigma = self._compute_simple()
+        elif returns_method == 'exponential':
+            if lambda_factor is None:
+                lambda_factor = 0.94
+            mu, sigma = self._compute_exponential(lambda_factor)
+        else:
+            raise ValueError(f"Unknown returns_method: {returns_method}")
+
+        portfolios = []
+        base_weights = [
+            ("equal_weight", np.ones(self.n_assets) / self.n_assets),
+        ]
+        for asset_index in range(self.n_assets):
+            single_asset = np.zeros(self.n_assets)
+            single_asset[asset_index] = 1.0
+            base_weights.append((f"single_asset_{asset_index}", single_asset))
+
+        for name, weights in base_weights:
+            variables = self.calculate_variables(weights, mu, sigma)
+            row = {
+                "portfolio_id": len(portfolios),
+                "source": name,
+                "return": variables["return"],
+                "risk": variables["risk"],
+                "sharpe": variables["sharpe"],
+            }
+            for label, weight in zip(self.raw_data_labels, weights):
+                row[f"weight_{label}"] = weight
+            portfolios.append(row)
+
+        random_count = max(0, n_portfolios - len(portfolios))
+        random_weights = np.random.dirichlet(np.ones(self.n_assets), size=random_count)
+        for weights in random_weights:
+            variables = self.calculate_variables(weights, mu, sigma)
+            row = {
+                "portfolio_id": len(portfolios),
+                "source": "random_simplex",
+                "return": variables["return"],
+                "risk": variables["risk"],
+                "sharpe": variables["sharpe"],
+            }
+            for label, weight in zip(self.raw_data_labels, weights):
+                row[f"weight_{label}"] = weight
+            portfolios.append(row)
+
+        frontier_df = pd.DataFrame(portfolios)
+        frontier_df = frontier_df.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=["return", "risk", "sharpe"]
+        )
+        return frontier_df.sort_values(["risk", "return"]).reset_index(drop=True)
+
+    def generate_target_return_frontier(
+        self,
+        n_points: int = 50,
+        returns_method: Literal['simple', 'exponential'] = 'simple',
+        lambda_factor: Optional[float] = None,
+    ) -> pd.DataFrame:
+        """
+        Generate optimized efficient-frontier points by minimizing risk at target returns.
+
+        This is additive reporting functionality: it does not change run(), optimizer
+        strategies, objective logic, or existing output keys.
+        """
+        if n_points < 2:
+            raise ValueError("n_points must be at least 2")
+
+        if returns_method == 'simple':
+            mu, sigma = self._compute_simple()
+        elif returns_method == 'exponential':
+            if lambda_factor is None:
+                lambda_factor = 0.94
+            mu, sigma = self._compute_exponential(lambda_factor)
+        else:
+            raise ValueError(f"Unknown returns_method: {returns_method}")
+
+        min_target = float(np.min(mu))
+        max_target = float(np.max(mu))
+        target_returns = np.linspace(min_target, max_target, n_points)
+        rows = []
+
+        for target_return in target_returns:
+            constraints = [
+                {'type': 'eq', 'fun': self._sum_weights_constraint},
+                {
+                    'type': 'eq',
+                    'fun': lambda weights, mu=mu, target=target_return: (
+                        np.dot(weights, mu) - target
+                    ),
+                },
+            ]
+            x0 = np.ones(self.n_assets) / self.n_assets
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = minimize(
+                    fun=lambda weights, sigma=sigma: np.dot(weights, np.dot(sigma, weights)),
+                    x0=x0,
+                    method='SLSQP',
+                    bounds=self.bounds,
+                    constraints=constraints,
+                    options={'ftol': 1e-8, 'maxiter': 1000, 'disp': False},
+                )
+
+            if not result.success:
+                continue
+
+            weights = result.x / np.sum(result.x)
+            variables = self.calculate_variables(weights, mu, sigma)
+            row = {
+                "portfolio_id": len(rows),
+                "source": "target_return_min_risk",
+                "target_return": target_return,
+                "return": variables["return"],
+                "risk": variables["risk"],
+                "sharpe": variables["sharpe"],
+            }
+            for label, weight in zip(self.raw_data_labels, weights):
+                row[f"weight_{label}"] = weight
+            rows.append(row)
+
+        frontier_df = pd.DataFrame(rows)
+        if frontier_df.empty:
+            return frontier_df
+
+        return frontier_df.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=["return", "risk", "sharpe"]
+        ).sort_values(["risk", "return"]).reset_index(drop=True)
+
+    @staticmethod
+    def extract_efficient_frontier(portfolios_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Extract the upper efficient frontier from generated risk/return points.
+
+        A point is retained when its expected return is higher than every lower-risk
+        point encountered so far.
+        """
+        required_columns = {"risk", "return"}
+        if not required_columns.issubset(portfolios_df.columns):
+            raise ValueError("portfolios_df must contain 'risk' and 'return' columns")
+
+        sorted_df = portfolios_df.sort_values(["risk", "return"]).reset_index(drop=True)
+        efficient_rows = []
+        best_return = -np.inf
+        for _, row in sorted_df.iterrows():
+            if row["return"] > best_return:
+                efficient_rows.append(row)
+                best_return = row["return"]
+
+        return pd.DataFrame(efficient_rows).reset_index(drop=True)
     
     def get_portfolio_summary(
         self,

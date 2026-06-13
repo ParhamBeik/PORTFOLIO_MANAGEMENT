@@ -1,0 +1,184 @@
+{
+  "ticker": "فوكا",
+  "industry": "فلزات اساسي",
+  "timeframe": "1W",
+  "metadata": {
+    "return_type": "log_return",
+    "calendar": "jalali"
+  },
+  "metrics": {
+    "annualized_expected_return": -0.1846024339397631,
+    "annualized_volatility": 0.4005262350226447,
+    "coverage": {
+      "weeks_available": 12,
+      "first_week": "1404-09-08",
+      "last_week": "1404-11-25"
+    },
+    "liquidity": {
+      "average_weekly_volume": 4352540.25,
+      "average_weekly_trade_value_toman": 4189183269.8333335,
+      "median_weekly_trade_value_toman": 4597049624.0
+    },
+    "risk": {
+      "max_drawdown": -0.12450980392156863
+    }
+  },
+  "data": [
+    {
+      "week_start_date": "1404-09-08",
+      "week_end_date": "1404-09-12",
+      "open": 9400.0,
+      "high": 9400.0,
+      "low": 9400.0,
+      "close": 9400.0,
+      "weekly_volume": 351866.0,
+      "weekly_trade_value_toman": 330754040.0,
+      "simple_return": null,
+      "log_return": null,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-09-15",
+      "week_end_date": "1404-09-19",
+      "open": 9670.0,
+      "high": 9830.0,
+      "low": 9120.0,
+      "close": 9710.0,
+      "weekly_volume": 4708341.0,
+      "weekly_trade_value_toman": 4500717876.0,
+      "simple_return": 0.03297872340425532,
+      "log_return": 0.03244659302727535,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-09-22",
+      "week_end_date": "1404-09-26",
+      "open": 9720.0,
+      "high": 9860.0,
+      "low": 9370.0,
+      "close": 9500.0,
+      "weekly_volume": 4915588.0,
+      "weekly_trade_value_toman": 4693381372.0,
+      "simple_return": -0.021627188465499485,
+      "log_return": -0.0218644836967384,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-09-29",
+      "week_end_date": "1404-10-03",
+      "open": 9890.0,
+      "high": 10200.0,
+      "low": 9600.0,
+      "close": 10200.0,
+      "weekly_volume": 6412784.0,
+      "weekly_trade_value_toman": 6347101480.0,
+      "simple_return": 0.07368421052631578,
+      "log_return": 0.07109592168373026,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-10-06",
+      "week_end_date": "1404-10-10",
+      "open": 10470.0,
+      "high": 10780.0,
+      "low": 9820.0,
+      "close": 10070.0,
+      "weekly_volume": 8730127.0,
+      "weekly_trade_value_toman": 9091283488.0,
+      "simple_return": -0.012745098039215686,
+      "log_return": -0.012827013559754425,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-10-13",
+      "week_end_date": "1404-10-17",
+      "open": 9890.0,
+      "high": 10000.0,
+      "low": 9450.0,
+      "close": 9650.0,
+      "weekly_volume": 5595173.0,
+      "weekly_trade_value_toman": 5470386660.0,
+      "simple_return": -0.041708043694141016,
+      "log_return": -0.042602791379576406,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-10-20",
+      "week_end_date": "1404-10-24",
+      "open": 9500.0,
+      "high": 9680.0,
+      "low": 8840.0,
+      "close": 8980.0,
+      "weekly_volume": 7555032.0,
+      "weekly_trade_value_toman": 7014153807.0,
+      "simple_return": -0.0694300518134715,
+      "log_return": -0.07195803303678633,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-10-27",
+      "week_end_date": "1404-11-01",
+      "open": 8720.0,
+      "high": 9900.0,
+      "low": 8720.0,
+      "close": 9870.0,
+      "weekly_volume": 2308989.0,
+      "weekly_trade_value_toman": 2186181501.0,
+      "simple_return": 0.09910913140311804,
+      "log_return": 0.094499971131282,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-11-04",
+      "week_end_date": "1404-11-08",
+      "open": 10060.0,
+      "high": 10060.0,
+      "low": 8810.0,
+      "close": 9020.0,
+      "weekly_volume": 6664817.0,
+      "weekly_trade_value_toman": 6206701638.0,
+      "simple_return": -0.08611955420466058,
+      "log_return": -0.09005551937085789,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-11-11",
+      "week_end_date": "1404-11-15",
+      "open": 9130.0,
+      "high": 9130.0,
+      "low": 8530.0,
+      "close": 8960.0,
+      "weekly_volume": 1948305.0,
+      "weekly_trade_value_toman": 1711334564.0,
+      "simple_return": -0.0066518847006651885,
+      "log_return": -0.006674107087693132,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-11-18",
+      "week_end_date": "1404-11-22",
+      "open": 9110.0,
+      "high": 9420.0,
+      "low": 8890.0,
+      "close": 8930.0,
+      "weekly_volume": 1504118.0,
+      "weekly_trade_value_toman": 1357782262.0,
+      "simple_return": -0.0033482142857142855,
+      "log_return": -0.0033538320984314402,
+      "rolling_26w_volatility": null
+    },
+    {
+      "week_start_date": "1404-11-25",
+      "week_end_date": "1404-11-29",
+      "open": 9040.0,
+      "high": 9180.0,
+      "low": 8660.0,
+      "close": 9040.0,
+      "weekly_volume": 1535343.0,
+      "weekly_trade_value_toman": 1360420550.0,
+      "simple_return": 0.012318029115341545,
+      "log_return": 0.012242779515677427,
+      "rolling_26w_volatility": null
+    }
+  ]
+}

@@ -5,13 +5,18 @@ __pycache__/
 *.log
 
 # Large data artifacts (broad rules)
+CANDLESTICKS/
 **/FETCH_*/
 **/data/
 **/daily/
 **/weekly/
 **/monthly/
 **/WEEKLY_OPTIMIZATION_DATA/
+!WEEKLY_OPTIMIZATION_DATA/
+!WEEKLY_OPTIMIZATION_DATA/*.json
 
 # Generated reports/outputs
 **/reports/
+!optimization_results/
+!optimization_results/*.json
 STOCKS/all_stocks_adjusted_returns.xlsx
