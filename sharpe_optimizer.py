@@ -691,14 +691,25 @@ class SharpeRatioOptimizerEnhanced:
         sigma: np.ndarray,
         w: float = 0.7,
         c1: float = 1.5,
-        c2: float = 1.5
+        c2: float = 1.5,
+        eval_func: Optional[Callable] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         """
         Execute one iteration of Particle Swarm Optimization.
         
-        Updates velocities and positions, evaluates fitness, and tracks best.
+        Updates velocities and positions, evaluates fitness (using a custom
+        evaluation function if provided, otherwise the internal _neg_sharpe),
+        and tracks best positions.
+        
+        Args:
+            eval_func: Optional callable(weights, mu, sigma) -> objective value
+                       (lower is better). If None, uses self._neg_sharpe.
         """
         n_particles, _ = positions.shape
+        
+        # Use provided evaluation function or default to negative Sharpe
+        if eval_func is None:
+            eval_func = self._neg_sharpe
         
         # Update velocities and positions
         r1 = np.random.uniform(0, 1, positions.shape)
@@ -712,13 +723,13 @@ class SharpeRatioOptimizerEnhanced:
         
         positions = positions + velocities
         
-        # Project onto simplex to maintain sum = 1
-        positions = np.maximum(positions, 0)  # Ensure non-negative
+        # Project onto simplex (sum=1, non-negative)
+        positions = np.maximum(positions, 0)
         positions = positions / (np.sum(positions, axis=1, keepdims=True) + 1e-10)
         
-        # Evaluate fitness
+        # Evaluate fitness for each particle
         for i in range(n_particles):
-            value = self._neg_sharpe(positions[i], mu, sigma)
+            value = eval_func(positions[i], mu, sigma)
             
             if value < best_values[i]:
                 best_values[i] = value
@@ -742,32 +753,63 @@ class SharpeRatioOptimizerEnhanced:
         track_history: bool = False
     ) -> Tuple[np.ndarray, float, Dict]:
         """
-        Step 7.4: Hybrid Metaheuristic + SLSQP
+        Step 7.4: Hybrid Metaheuristic + SLSQP with constraint handling in PSO.
         
-        Phase 1: Particle Swarm Optimization (PSO)
-        Phase 2: Local refinement with SLSQP
+        Phase 1: Particle Swarm Optimization (PSO) with penalty for constraint violations.
+        Phase 2: Local refinement with SLSQP (which natively handles constraints).
         
         Args:
             mu: Expected returns
             sigma: Covariance matrix
-            min_return: Minimum return constraint
-            max_risk: Maximum risk constraint
+            min_return: Minimum portfolio return constraint (optional)
+            max_risk: Maximum portfolio risk constraint (optional)
             n_particles: Number of PSO particles
             n_iter: Number of PSO iterations
             verbose: Print progress
-            track_history: If True, record PSO history (best weights per iteration) and SLSQP iteration history
+            track_history: If True, record PSO history and SLSQP iterations
             
         Returns:
             Tuple of (final_weights, sharpe_ratio, info_dict)
-            info_dict contains 'pso_history' (list of best weights per iteration) and 'refinement_info'
         """
         start_time_total = time.time()
-        # Phase 1: PSO Initialization
-        positions = np.array([np.random.dirichlet(np.ones(self.n_assets)) 
-                            for _ in range(n_particles)])
+        
+        # ---------- Helper: penalized objective for PSO ----------
+        PENALTY_FACTOR = 1e6   # large enough to discourage violations
+        
+        def penalized_neg_sharpe(weights: np.ndarray, mu_vec: np.ndarray, sigma_mat: np.ndarray) -> float:
+            """Negative Sharpe plus quadratic penalties for min_return and max_risk violations."""
+            # Base objective
+            port_ret = np.dot(weights, mu_vec)
+            port_var = np.dot(weights, np.dot(sigma_mat, weights))
+            port_risk = np.sqrt(port_var)
+            
+            # Penalty for near-zero risk
+            if port_risk < 1e-8:
+                return 1e10
+            
+            neg_sharpe = - (port_ret - self.risk_free_rate) / port_risk
+            
+            # Penalty for min return violation
+            penalty = 0.0
+            if min_return is not None:
+                ret_violation = max(0.0, min_return - port_ret)
+                penalty += PENALTY_FACTOR * (ret_violation ** 2)
+            
+            # Penalty for max risk violation
+            if max_risk is not None:
+                risk_violation = max(0.0, port_risk - max_risk)
+                penalty += PENALTY_FACTOR * (risk_violation ** 2)
+            
+            return neg_sharpe + penalty
+        
+        # ---------- Phase 1: PSO with penalized objective ----------
+        # Initialize particles (random Dirichlet)
+        positions = np.array([np.random.dirichlet(np.ones(self.n_assets))
+                              for _ in range(n_particles)])
         velocities = np.random.uniform(-0.1, 0.1, positions.shape)
+        
         best_positions = positions.copy()
-        best_values = np.array([self._neg_sharpe(pos, mu, sigma) for pos in positions])
+        best_values = np.array([penalized_neg_sharpe(pos, mu, sigma) for pos in positions])
         
         global_best_idx = np.argmin(best_values)
         global_best_position = best_positions[global_best_idx].copy()
@@ -777,12 +819,13 @@ class SharpeRatioOptimizerEnhanced:
         if track_history:
             pso_history.append(global_best_position.copy())
         
-        # Phase 1: PSO iterations
+        # PSO main loop
         for iteration in range(n_iter):
             positions, velocities, best_positions, global_best_position, global_best_value = \
                 self._pso_step(
                     positions, velocities, best_positions, global_best_position,
-                    best_values, global_best_value, mu, sigma
+                    best_values, global_best_value, mu, sigma,
+                    eval_func=penalized_neg_sharpe   # <-- enforce constraints via penalty
                 )
             
             if track_history:
@@ -790,13 +833,14 @@ class SharpeRatioOptimizerEnhanced:
             
             if verbose and (iteration + 1) % max(1, n_iter // 5) == 0:
                 print(f"  PSO iteration {iteration+1}/{n_iter}: "
-                      f"Best Sharpe = {-global_best_value:.6f}")
+                      f"Best penalized objective = {global_best_value:.6f}")
         
         pso_time = time.time() - start_time_total
         
-        # Phase 2: Refine with SLSQP
+        # ---------- Phase 2: Refine with SLSQP (handles constraints exactly) ----------
         start_refine = time.time()
         refinement_iter_weights = []
+        
         def refine_callback(xk):
             if track_history:
                 refinement_iter_weights.append(xk.copy())
@@ -807,9 +851,13 @@ class SharpeRatioOptimizerEnhanced:
         )
         refine_time = time.time() - start_refine
         
+        # Fallback: if SLSQP fails, keep the best PSO solution (evaluate true Sharpe)
         if weights is None:
             weights = global_best_position
-            sharpe = -global_best_value
+            # Compute true Sharpe (without penalty) for the returned solution
+            port_ret = np.dot(weights, mu)
+            port_risk = np.sqrt(np.dot(weights, np.dot(sigma, weights)))
+            sharpe = (port_ret - self.risk_free_rate) / port_risk if port_risk > 1e-8 else -np.inf
         
         total_elapsed = time.time() - start_time_total
         info = {
