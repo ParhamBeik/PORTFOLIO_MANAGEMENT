@@ -17,6 +17,9 @@ Features:
 - Comprehensive utility methods and testing support
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from typing import Union, Tuple, Dict, Optional, Literal, List, Callable
@@ -1255,6 +1258,83 @@ class SharpeRatioOptimizerEnhanced:
         return frontier_df.replace([np.inf, -np.inf], np.nan).dropna(
             subset=["return", "risk", "sharpe"]
         ).sort_values(["risk", "return"]).reset_index(drop=True)
+
+    def generate_and_save_efficient_frontier(
+        self,
+        output_file: Union[str, Path],
+        n_points: int = 50,
+        returns_method: Literal['simple', 'exponential'] = 'simple',
+        lambda_factor: Optional[float] = None,
+        weight_threshold: float = 1e-8,
+    ) -> List[Dict]:
+        """
+        Generate and save a target-return efficient frontier as standalone JSON.
+
+        This is strictly additive reporting functionality. It does not call or
+        alter the max-Sharpe optimizer path, objective function, constraints,
+        bounds, or stored optimization results.
+        """
+        if n_points < 2:
+            raise ValueError("n_points must be at least 2")
+
+        if returns_method == 'simple':
+            mu, sigma = self._compute_simple()
+        elif returns_method == 'exponential':
+            if lambda_factor is None:
+                lambda_factor = 0.94
+            mu, sigma = self._compute_exponential(lambda_factor)
+        else:
+            raise ValueError(f"Unknown returns_method: {returns_method}")
+
+        target_returns = np.linspace(float(np.min(mu)), float(np.max(mu)), n_points)
+        frontier_points = []
+
+        for target_return in target_returns:
+            constraints = [
+                {'type': 'eq', 'fun': self._sum_weights_constraint},
+                {
+                    'type': 'eq',
+                    'fun': lambda weights, mu=mu, target=target_return: (
+                        np.dot(weights, mu) - target
+                    ),
+                },
+            ]
+            x0 = np.ones(self.n_assets) / self.n_assets
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = minimize(
+                    fun=lambda weights, sigma=sigma: np.dot(weights, np.dot(sigma, weights)),
+                    x0=x0,
+                    method='SLSQP',
+                    bounds=[(0.0, 1.0)] * self.n_assets,
+                    constraints=constraints,
+                    options={'ftol': 1e-8, 'maxiter': 1000, 'disp': False},
+                )
+
+            if not result.success:
+                continue
+
+            weights = result.x / np.sum(result.x)
+            variables = self.calculate_variables(weights, mu, sigma)
+            cleaned_weights = {
+                label: float(0.0 if abs(weight) < weight_threshold else weight)
+                for label, weight in zip(self.raw_data_labels, weights)
+            }
+            frontier_points.append(
+                {
+                    "risk": float(variables["risk"]),
+                    "return": float(variables["return"]),
+                    "weights": cleaned_weights,
+                }
+            )
+
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as file_obj:
+            json.dump(frontier_points, file_obj, ensure_ascii=False, indent=2)
+
+        return frontier_points
 
     @staticmethod
     def extract_efficient_frontier(portfolios_df: pd.DataFrame) -> pd.DataFrame:

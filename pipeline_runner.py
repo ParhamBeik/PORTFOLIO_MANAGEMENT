@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from math import log1p
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -131,6 +131,10 @@ class PipelineRunner:
                 payload = json.load(file_obj)
 
             self.validate_weekly_payload(payload, file_path)
+            ticker = str(payload.get("ticker") or file_path.stem)
+            if ticker.endswith("ح"):
+                continue
+
             rows = payload.get("data", [])
 
             frame = pd.DataFrame(rows)
@@ -152,7 +156,7 @@ class PipelineRunner:
 
             assets.append(
                 AssetDataset(
-                    ticker=str(payload.get("ticker") or file_path.stem),
+                    ticker=ticker,
                     industry=str(payload.get("industry") or "UNKNOWN"),
                     source_file=file_path,
                     data=frame,
@@ -170,48 +174,36 @@ class PipelineRunner:
 
         return assets
 
-    def choose_coverage_cutoff(self, assets: Iterable[AssetDataset]) -> int:
-        history_lengths = sorted({asset.weeks_available for asset in assets})
-        if len(history_lengths) < 3:
-            return int(np.percentile(history_lengths, 80))
-
-        points = np.array(
-            [
-                [weeks, sum(asset.weeks_available >= weeks for asset in assets)]
-                for weeks in history_lengths
-            ],
-            dtype=float,
-        )
-        first = points[0]
-        last = points[-1]
-        line = last - first
-        line_norm = np.linalg.norm(line)
-        if line_norm == 0:
-            return int(np.percentile(history_lengths, 80))
-
-        distances = np.abs(
-            line[0] * (first[1] - points[:, 1]) - line[1] * (first[0] - points[:, 0])
-        ) / line_norm
-        elbow_index = int(np.argmax(distances))
-        return int(points[elbow_index, 0])
-
     def select_assets(self, assets: List[AssetDataset]) -> List[AssetDataset]:
-        coverage_cutoff = self.choose_coverage_cutoff(assets)
-        survivors = [asset for asset in assets if asset.weeks_available >= coverage_cutoff]
-
-        if len(survivors) < self.min_assets:
-            fallback_cutoff = int(np.percentile([asset.weeks_available for asset in assets], 80))
-            survivors = [asset for asset in assets if asset.weeks_available >= fallback_cutoff]
-
-        selected = sorted(
-            survivors,
+        candidates = sorted(
+            assets,
             key=lambda asset: (asset.median_trade_value_toman, asset.weeks_available),
             reverse=True,
-        )[: self.max_assets]
+        )
+
+        selected = []
+        common_weeks = None
+        for asset in candidates:
+            asset_weeks = set(asset.data["week_start_date"].dropna())
+            if len(asset_weeks) < self.min_weeks:
+                continue
+
+            candidate_common_weeks = (
+                asset_weeks if common_weeks is None else common_weeks & asset_weeks
+            )
+            if len(candidate_common_weeks) < self.min_weeks:
+                continue
+
+            selected.append(asset)
+            common_weeks = candidate_common_weeks
+
+            if len(selected) >= self.max_assets:
+                break
 
         if len(selected) < self.min_assets:
             raise ValueError(
-                f"Selected only {len(selected)} assets; minimum required is {self.min_assets}."
+                f"Selected only {len(selected)} assets with at least {self.min_weeks} "
+                f"common weeks; minimum required is {self.min_assets}."
             )
 
         return selected
@@ -237,6 +229,7 @@ class PipelineRunner:
 
         returns_df = pd.concat(return_frames, axis=1, join="inner").sort_index()
         returns_df = returns_df.apply(pd.to_numeric, errors="coerce").dropna(axis=0, how="any")
+        returns_df = returns_df.tail(self.min_weeks)
 
         if returns_df.shape[0] < self.min_weeks:
             raise ValueError(
@@ -264,6 +257,9 @@ class PipelineRunner:
             try:
                 with file_path.open("r", encoding="utf-8") as file_obj:
                     payload = json.load(file_obj)
+                ticker = str(payload.get("ticker") or file_path.stem)
+                if ticker.endswith("ح"):
+                    continue
                 self.validate_weekly_payload(payload, file_path)
             except Exception as exc:
                 validation_errors.append(str(exc))
@@ -316,6 +312,7 @@ class PipelineRunner:
             strategy=strategy,
             random_seed=random_seed,
             verbose=verbose,
+            track_history=True,
             **strategy_kwargs,
         )
 
@@ -329,19 +326,31 @@ class PipelineRunner:
         annualized_risk = (
             float(weekly_risk * np.sqrt(52.0)) if weekly_risk is not None else None
         )
+        portfolio_payload = {
+            "weights": {
+                label: json_number(weight)
+                for label, weight in zip(labels, weights if weights is not None else [])
+            },
+            "weekly_return": weekly_return,
+            "weekly_risk": weekly_risk,
+            "sharpe": json_number(result.get("sharpe")),
+            "annualized_return": json_number(annualized_return),
+            "annualized_risk": json_number(annualized_risk),
+        }
         output = {
             "success": bool(result.get("success")),
             "message": result.get("message"),
-            "portfolio": {
-                "weights": {
-                    label: json_number(weight)
-                    for label, weight in zip(labels, weights if weights is not None else [])
-                },
-                "weekly_return": weekly_return,
-                "weekly_risk": weekly_risk,
-                "sharpe": json_number(result.get("sharpe")),
-                "annualized_return": json_number(annualized_return),
-                "annualized_risk": json_number(annualized_risk),
+            "_optimizer": optimizer,
+            "portfolio": portfolio_payload,
+            "visualization_outputs": {
+                "optimal_portfolio": self._build_optimal_portfolio_payload(portfolio_payload),
+                "random_samples_cloud": {"samples": []},
+                "optimization_trajectory": self._build_trajectory_payload(
+                    result.get("history"),
+                    labels,
+                    optimizer,
+                    strategy,
+                ),
             },
             "settings": {
                 "annual_risk_free_rate": self.annual_risk_free_rate,
@@ -374,23 +383,132 @@ class PipelineRunner:
             },
         }
 
+        portfolios_df = optimizer.generate_efficient_frontier(
+            n_portfolios=frontier_portfolios,
+            returns_method=returns_method,
+            random_seed=random_seed,
+        )
+        portfolio_variations = self._serialize_frontier_dataframe(portfolios_df)
+        output["visualization_outputs"]["random_samples_cloud"] = (
+            self._build_random_samples_payload(portfolio_variations, labels)
+        )
+
         if include_frontier:
-            portfolios_df = optimizer.generate_efficient_frontier(
-                n_portfolios=frontier_portfolios,
-                returns_method=returns_method,
-                random_seed=random_seed,
-            )
             efficient_df = optimizer.generate_target_return_frontier(
                 n_points=frontier_points,
                 returns_method=returns_method,
             )
-            output["portfolio_variations"] = self._serialize_frontier_dataframe(portfolios_df)
+            output["portfolio_variations"] = portfolio_variations
             output["efficient_frontier"] = self._serialize_frontier_dataframe(efficient_df)
             output["settings"]["include_frontier"] = True
             output["settings"]["frontier_portfolios"] = frontier_portfolios
             output["settings"]["frontier_points"] = frontier_points
 
         return output
+
+    @staticmethod
+    def _build_optimal_portfolio_payload(portfolio: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "metrics": {
+                "sharpe_ratio": portfolio["sharpe"],
+                "expected_return": portfolio["weekly_return"],
+                "volatility": portfolio["weekly_risk"],
+                "annualized_return": portfolio["annualized_return"],
+                "annualized_volatility": portfolio["annualized_risk"],
+            },
+            "weights": portfolio["weights"],
+        }
+
+    @staticmethod
+    def _build_random_samples_payload(
+        portfolio_variations: List[Dict[str, Any]],
+        labels: List[str],
+    ) -> Dict[str, Any]:
+        samples = []
+        for row in portfolio_variations:
+            samples.append(
+                {
+                    "risk": json_number(row.get("risk")),
+                    "return": json_number(row.get("return")),
+                    "weights": {
+                        label: json_number(row.get(f"weight_{label}"))
+                        for label in labels
+                        if f"weight_{label}" in row
+                    },
+                }
+            )
+        return {"samples": samples}
+
+    def _build_trajectory_payload(
+        self,
+        history: Any,
+        labels: List[str],
+        optimizer: SharpeRatioOptimizerEnhanced,
+        strategy: str,
+    ) -> Dict[str, Any]:
+        weight_path = self._extract_slsqp_weight_path(history, strategy)
+        trajectory = []
+        if optimizer.last_mu is None or optimizer.last_sigma is None:
+            return {"trajectory": trajectory}
+
+        for iteration, weights in enumerate(weight_path, start=1):
+            if weights is None:
+                continue
+            weights_array = np.asarray(weights, dtype=float)
+            variables = optimizer.calculate_variables(
+                weights_array,
+                optimizer.last_mu,
+                optimizer.last_sigma,
+            )
+            trajectory.append(
+                {
+                    "iteration": iteration,
+                    "risk": json_number(variables["risk"]),
+                    "return": json_number(variables["return"]),
+                    "weights": {
+                        label: json_number(weight)
+                        for label, weight in zip(labels, weights_array)
+                    },
+                }
+            )
+
+        return {"trajectory": trajectory}
+
+    @staticmethod
+    def _extract_slsqp_weight_path(history: Any, strategy: str) -> List[Any]:
+        if history is None:
+            return []
+
+        if strategy == "basic":
+            return list(history)
+
+        if strategy == "multi_start":
+            successful_starts = [
+                start for start in history
+                if start.get("final_weights") is not None and start.get("iteration_weights")
+            ]
+            if not successful_starts:
+                return []
+            best_start = max(successful_starts, key=lambda start: start.get("sharpe", -np.inf))
+            return list(best_start.get("iteration_weights", []))
+
+        if strategy == "smart_start":
+            successful_candidates = [
+                candidate for candidate in history
+                if candidate.get("final_weights") is not None and candidate.get("iteration_weights")
+            ]
+            if not successful_candidates:
+                return []
+            best_candidate = max(
+                successful_candidates,
+                key=lambda candidate: candidate.get("sharpe", -np.inf),
+            )
+            return list(best_candidate.get("iteration_weights", []))
+
+        if strategy == "hybrid" and isinstance(history, dict):
+            return list(history.get("refinement_iteration_weights") or [])
+
+        return []
 
     @staticmethod
     def _serialize_frontier_dataframe(frontier_df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -405,10 +523,51 @@ class PipelineRunner:
         return serialized
 
     @staticmethod
-    def save_results(results: Dict[str, Any], output_file: Path) -> None:
+    def save_results(results: Dict[str, Any], output_file: Path) -> List[Path]:
         output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        visualization_outputs = results.get("visualization_outputs")
+        if visualization_outputs:
+            output_dir = output_file.parent if output_file.suffix else output_file
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_paths = {
+                "optimal_portfolio": output_dir / "optimal_portfolio.json",
+                "random_samples_cloud": output_dir / "random_samples_cloud.json",
+                "optimization_trajectory": output_dir / "optimization_trajectory.json",
+            }
+            for key, path in output_paths.items():
+                with path.open("w", encoding="utf-8") as file_obj:
+                    json.dump(visualization_outputs[key], file_obj, ensure_ascii=False, indent=2)
+            return list(output_paths.values())
+
         with output_file.open("w", encoding="utf-8") as file_obj:
-            json.dump(results, file_obj, ensure_ascii=False, indent=2)
+            json.dump(
+                {key: value for key, value in results.items() if key != "_optimizer"},
+                file_obj,
+                ensure_ascii=False,
+                indent=2,
+            )
+        return [output_file]
+
+    @staticmethod
+    def save_efficient_frontier(
+        results: Dict[str, Any],
+        output_file: Path,
+        n_points: int,
+        returns_method: str,
+    ) -> Optional[Path]:
+        optimizer = results.get("_optimizer")
+        if optimizer is None or not results.get("success"):
+            return None
+
+        output_dir = output_file.parent if output_file.suffix else output_file
+        output_path = output_dir / "efficient_frontier.json"
+        optimizer.generate_and_save_efficient_frontier(
+            output_file=output_path,
+            n_points=n_points,
+            returns_method=returns_method,
+        )
+        return output_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -498,7 +657,15 @@ def main() -> int:
             "message": str(exc),
         }
 
-    runner.save_results(results, args.output_file)
+    saved_paths = runner.save_results(results, args.output_file)
+    frontier_path = runner.save_efficient_frontier(
+        results=results,
+        output_file=args.output_file,
+        n_points=args.frontier_points,
+        returns_method=args.returns_method,
+    )
+    if frontier_path is not None:
+        saved_paths.append(frontier_path)
 
     print(f"Success: {results['success']}")
     if args.validate_only:
@@ -524,7 +691,9 @@ def main() -> int:
                 print(f"Efficient frontier points: {len(results.get('efficient_frontier', []))}")
         else:
             print(f"Error: {results.get('message')}")
-    print(f"Results saved to: {args.output_file}")
+    print("Results saved to:")
+    for path in saved_paths:
+        print(f"  {path}")
     return 0 if results["success"] else 1
 
 
