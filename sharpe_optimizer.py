@@ -49,7 +49,8 @@ class SharpeRatioOptimizerEnhanced:
         self,
         raw_data: Union[np.ndarray, pd.DataFrame],
         risk_free_rate: float,
-        data_type: Literal['price', 'return', 'auto'] = 'auto'
+        data_type: Literal['price', 'return', 'auto'] = 'auto',
+        max_asset_weight: float = 0.30
     ):
         """
         Step 1: Class Initialization and Data Storage
@@ -85,6 +86,14 @@ class SharpeRatioOptimizerEnhanced:
         
         self.raw_data = data_array
         self.risk_free_rate = risk_free_rate
+        if not 0 < max_asset_weight <= 1:
+            raise ValueError("max_asset_weight must be in the interval (0, 1]")
+        if data_array.shape[1] * max_asset_weight < 1.0 - 1e-12:
+            raise ValueError(
+                "max_asset_weight is infeasible for the number of assets: "
+                f"{data_array.shape[1]} assets * {max_asset_weight:.4f} < 1"
+            )
+        self.max_asset_weight = float(max_asset_weight)
         
         # Determine if input is prices or returns
         self.data_type = data_type
@@ -102,8 +111,8 @@ class SharpeRatioOptimizerEnhanced:
         # Store dimensions
         self.T, self.n_assets = self.returns_matrix.shape
         
-        # Set default bounds: 0 ≤ w_i ≤ 1 for all assets (no short selling)
-        self.bounds = [(0.0, 1.0) for _ in range(self.n_assets)]
+        # Set default bounds: no short selling and per-asset concentration cap.
+        self.bounds = [(0.0, self.max_asset_weight) for _ in range(self.n_assets)]
         
         # Initialize storage for results
         self.last_mu = None
@@ -131,6 +140,91 @@ class SharpeRatioOptimizerEnhanced:
             raise ValueError("returns_matrix must contain at least one asset")
         if not np.isfinite(returns_matrix).all():
             raise ValueError("returns_matrix contains NaN or infinite values")
+
+    def _project_to_capped_simplex(self, weights: np.ndarray) -> np.ndarray:
+        weights = np.asarray(weights, dtype=float).copy()
+        if weights.shape[0] != self.n_assets:
+            raise ValueError(f"weights length {weights.shape[0]} != n_assets {self.n_assets}")
+        if not np.isfinite(weights).all():
+            weights = np.ones(self.n_assets) / self.n_assets
+
+        weights = np.maximum(weights, 0.0)
+        total = np.sum(weights)
+        if total <= 1e-12:
+            weights = np.ones(self.n_assets) / self.n_assets
+        else:
+            weights = weights / total
+
+        capped = np.zeros(self.n_assets)
+        free = np.ones(self.n_assets, dtype=bool)
+        remaining = 1.0
+        current = weights.copy()
+
+        while True:
+            if not np.any(free):
+                break
+
+            free_weights = current[free]
+            free_total = np.sum(free_weights)
+            if free_total <= 1e-12:
+                current[free] = remaining / np.sum(free)
+            else:
+                current[free] = free_weights / free_total * remaining
+
+            over_free = free & (current > self.max_asset_weight)
+            if not np.any(over_free):
+                capped[free] = current[free]
+                break
+
+            capped[over_free] = self.max_asset_weight
+            remaining = 1.0 - np.sum(capped)
+            free[over_free] = False
+            current[~free] = capped[~free]
+
+        capped_sum = np.sum(capped)
+        if capped_sum <= 1e-12:
+            return np.ones(self.n_assets) / self.n_assets
+        return capped / capped_sum
+
+    def _sample_bounded_simplex(self, count: int) -> np.ndarray:
+        if count < 1:
+            return np.empty((0, self.n_assets))
+
+        samples = []
+        batch_size = max(1000, count * 5)
+        max_attempts = 20
+        for _ in range(max_attempts):
+            batch = np.random.dirichlet(np.ones(self.n_assets), size=batch_size)
+            feasible = batch[np.max(batch, axis=1) <= self.max_asset_weight + 1e-12]
+            samples.extend(feasible[: max(0, count - len(samples))])
+            if len(samples) >= count:
+                break
+
+        while len(samples) < count:
+            sample = np.random.dirichlet(np.ones(self.n_assets))
+            samples.append(self._project_to_capped_simplex(sample))
+
+        return np.asarray(samples[:count])
+
+    def _add_portfolio_row(
+        self,
+        portfolios: List[Dict],
+        weights: np.ndarray,
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        source: str,
+    ) -> None:
+        variables = self.calculate_variables(weights, mu, sigma)
+        row = {
+            "portfolio_id": len(portfolios),
+            "source": source,
+            "return": variables["return"],
+            "risk": variables["risk"],
+            "sharpe": variables["sharpe"],
+        }
+        for label, weight in zip(self.raw_data_labels, weights):
+            row[f"weight_{label}"] = weight
+        portfolios.append(row)
     
     @staticmethod
     def _detect_data_type(data: np.ndarray) -> str:
@@ -408,6 +502,7 @@ class SharpeRatioOptimizerEnhanced:
         """
         # Build constraints
         constraints = self._build_constraints(mu, sigma, min_return, max_risk)
+        x0 = self._project_to_capped_simplex(x0)
         
         # SLSQP options
         options = {
@@ -430,7 +525,7 @@ class SharpeRatioOptimizerEnhanced:
             )
         
         if result.success:
-            weights = result.x / np.sum(result.x)  # Ensure sum to 1
+            weights = self._project_to_capped_simplex(result.x)
             sharpe = -result.fun
             return weights, sharpe, None  # iteration history is captured via callback if needed
         else:
@@ -519,8 +614,7 @@ class SharpeRatioOptimizerEnhanced:
         
         for i in range(n_starts):
             start_time_start = time.time()
-            # Generate random weights via Dirichlet
-            x0 = np.random.dirichlet(np.ones(self.n_assets))
+            x0 = self._sample_bounded_simplex(1)[0]
             
             iteration_weights = []
             def callback(xk):
@@ -547,7 +641,7 @@ class SharpeRatioOptimizerEnhanced:
             starts_details.append(start_info)
             
             if verbose and (i + 1) % max(1, n_starts // 5) == 0:
-                print(f"  Multi-start {i+1}/{n_starts}: Best Sharpe = {best_sharpe:.6f}")
+                print(f"  {i + 1:>3}/{n_starts:<3} best_sharpe={best_sharpe:.6f}")
         
         if best_weights is None:
             raise ValueError("All multi-start attempts failed")
@@ -599,14 +693,14 @@ class SharpeRatioOptimizerEnhanced:
         candidate_names = []
         
         # 1. Equal weights
-        candidates.append(np.ones(self.n_assets) / self.n_assets)
+        candidates.append(self._project_to_capped_simplex(np.ones(self.n_assets) / self.n_assets))
         candidate_names.append("Equal Weight")
         
         # 2. Maximum return asset
         max_idx = np.argmax(mu)
         w_max_return = np.zeros(self.n_assets)
         w_max_return[max_idx] = 1.0
-        candidates.append(w_max_return)
+        candidates.append(self._project_to_capped_simplex(w_max_return))
         candidate_names.append("Max Return Asset")
         
         # 3. Minimum variance portfolio (fallback to equal weights if singular)
@@ -614,13 +708,12 @@ class SharpeRatioOptimizerEnhanced:
             sigma_inv = np.linalg.inv(sigma)
             ones = np.ones(self.n_assets)
             w_min_var = np.dot(sigma_inv, ones) / np.dot(ones, np.dot(sigma_inv, ones))
-            w_min_var = np.clip(w_min_var, 0, 1)
-            w_min_var = w_min_var / np.sum(w_min_var)
+            w_min_var = self._project_to_capped_simplex(w_min_var)
             candidates.append(w_min_var)
             candidate_names.append("Minimum Variance")
         except np.linalg.LinAlgError:
             # If covariance is singular, use equal weights as fallback
-            candidates.append(np.ones(self.n_assets) / self.n_assets)
+            candidates.append(self._project_to_capped_simplex(np.ones(self.n_assets) / self.n_assets))
             candidate_names.append("Minimum Variance (fallback to equal)")
         
         # 4. Sharpe‑proportional weights
@@ -630,10 +723,10 @@ class SharpeRatioOptimizerEnhanced:
         positive_sharpes = np.maximum(asset_sharpes, 0.0)  # ignore negative Sharpes
         
         if np.sum(positive_sharpes) > 0:
-            w_sharpe = positive_sharpes / np.sum(positive_sharpes)
+            w_sharpe = self._project_to_capped_simplex(positive_sharpes)
         else:
             # Fallback: equal weights if no positive Sharpe
-            w_sharpe = np.ones(self.n_assets) / self.n_assets
+            w_sharpe = self._project_to_capped_simplex(np.ones(self.n_assets) / self.n_assets)
         
         candidates.append(w_sharpe)
         candidate_names.append("Sharpe‑Proportional")
@@ -670,7 +763,8 @@ class SharpeRatioOptimizerEnhanced:
                 best_weights = weights
             
             if verbose:
-                print(f"  {name:25} → Sharpe = {sharpe:.6f} (time: {elapsed_candidate:.4f}s)")
+                status = "ok" if weights is not None else "failed"
+                print(f"  {name:<24} sharpe={sharpe:>10.6f} time={elapsed_candidate:>7.4f}s {status}")
         
         if best_weights is None:
             raise ValueError("All smart-start candidates failed")
@@ -725,10 +819,7 @@ class SharpeRatioOptimizerEnhanced:
         )
         
         positions = positions + velocities
-        
-        # Project onto simplex (sum=1, non-negative)
-        positions = np.maximum(positions, 0)
-        positions = positions / (np.sum(positions, axis=1, keepdims=True) + 1e-10)
+        positions = np.array([self._project_to_capped_simplex(pos) for pos in positions])
         
         # Evaluate fitness for each particle
         for i in range(n_particles):
@@ -807,8 +898,7 @@ class SharpeRatioOptimizerEnhanced:
         
         # ---------- Phase 1: PSO with penalized objective ----------
         # Initialize particles (random Dirichlet)
-        positions = np.array([np.random.dirichlet(np.ones(self.n_assets))
-                              for _ in range(n_particles)])
+        positions = self._sample_bounded_simplex(n_particles)
         velocities = np.random.uniform(-0.1, 0.1, positions.shape)
         
         best_positions = positions.copy()
@@ -835,8 +925,7 @@ class SharpeRatioOptimizerEnhanced:
                 pso_history.append(global_best_position.copy())
             
             if verbose and (iteration + 1) % max(1, n_iter // 5) == 0:
-                print(f"  PSO iteration {iteration+1}/{n_iter}: "
-                      f"Best penalized objective = {global_best_value:.6f}")
+                print(f"  {iteration + 1:>3}/{n_iter:<3} best_objective={global_best_value:.6f}")
         
         pso_time = time.time() - start_time_total
         
@@ -856,7 +945,7 @@ class SharpeRatioOptimizerEnhanced:
         
         # Fallback: if SLSQP fails, keep the best PSO solution (evaluate true Sharpe)
         if weights is None:
-            weights = global_best_position
+            weights = self._project_to_capped_simplex(global_best_position)
             # Compute true Sharpe (without penalty) for the returned solution
             port_ret = np.dot(weights, mu)
             port_risk = np.sqrt(np.dot(weights, np.dot(sigma, weights)))
@@ -928,24 +1017,24 @@ class SharpeRatioOptimizerEnhanced:
             np.random.seed(random_seed)
         
         if verbose:
-            print(f"\n{'='*70}")
-            print(f"Starting Sharpe Ratio Optimization")
-            print(f"{'='*70}")
-            print(f"Assets: {self.n_assets}, Time periods: {self.T}")
-            print(f"Risk-free rate: {self.risk_free_rate:.4f}")
+            print("\n--- Optimizer Input ---")
+            print(f"Assets       : {self.n_assets}")
+            print(f"Periods      : {self.T}")
+            print(f"Risk-free    : {self.risk_free_rate:.6f}")
+            print(f"Weight cap   : {self.max_asset_weight:.2%}")
         
         try:
             # Step 1: Compute μ and Σ
             if returns_method == 'simple':
                 mu, sigma = self._compute_simple()
                 if verbose:
-                    print(f"Return estimation: Simple average")
+                    print("Return model : Simple average")
             elif returns_method == 'exponential':
                 if lambda_factor is None:
                     lambda_factor = 0.94
                 mu, sigma = self._compute_exponential(lambda_factor)
                 if verbose:
-                    print(f"Return estimation: Exponential (λ = {lambda_factor})")
+                    print(f"Return model : Exponential (lambda={lambda_factor})")
             else:
                 raise ValueError(f"Unknown returns_method: {returns_method}")
             
@@ -953,20 +1042,21 @@ class SharpeRatioOptimizerEnhanced:
             self.last_sigma = sigma
             
             if verbose:
-                print(f"Expected returns (first 3): {mu[:min(3, len(mu))]}")
-                print(f"Constraints: min_return={min_return}, max_risk={max_risk}")
+                print(f"Mu shape     : {mu.shape}")
+                print(f"Sigma shape  : {sigma.shape}")
+                print(f"Constraints  : min_return={min_return}, max_risk={max_risk}")
             
             # Step 2: Run optimization based on strategy
             if strategy == 'basic':
                 if verbose:
-                    print(f"Strategy: Basic SLSQP")
+                    print("Strategy     : Basic SLSQP")
                 weights, sharpe, info = self._basic_slsqp(mu, sigma, min_return, max_risk, track_history)
                 history = info.get('iteration_weights') if track_history else None
             
             elif strategy == 'multi_start':
                 n_starts = strategy_kwargs.get('n_starts', 10)
                 if verbose:
-                    print(f"Strategy: Multi-Start ({n_starts} starts)")
+                    print(f"Strategy     : Multi-start ({n_starts} starts)")
                 weights, sharpe, info = self._multi_start(
                     n_starts, mu, sigma, min_return, max_risk, verbose=verbose, track_history=track_history
                 )
@@ -974,7 +1064,7 @@ class SharpeRatioOptimizerEnhanced:
             
             elif strategy == 'smart_start':
                 if verbose:
-                    print(f"Strategy: Smart Initialization (no random candidate)")
+                    print("Strategy     : Smart initialization")
                 weights, sharpe, info = self._smart_start(
                     mu, sigma, min_return, max_risk, verbose=verbose, track_history=track_history
                 )
@@ -984,7 +1074,7 @@ class SharpeRatioOptimizerEnhanced:
                 n_particles = strategy_kwargs.get('n_particles', 30)
                 n_iter = strategy_kwargs.get('n_iter', 50)
                 if verbose:
-                    print(f"Strategy: Hybrid PSO+SLSQP ({n_particles} particles, {n_iter} iter)")
+                    print(f"Strategy     : Hybrid PSO+SLSQP ({n_particles} particles, {n_iter} iter)")
                 weights, sharpe, info = self._hybrid(
                     mu, sigma, min_return, max_risk, n_particles, n_iter, verbose=verbose, track_history=track_history
                 )
@@ -1014,6 +1104,13 @@ class SharpeRatioOptimizerEnhanced:
                 valid = False
                 messages.append(f"Sum of weights = {np.sum(weights):.8f} (not 1.0)")
 
+            if np.max(weights) > self.max_asset_weight + 1e-6:
+                valid = False
+                messages.append(
+                    f"Max asset weight {np.max(weights):.6f} exceeds cap "
+                    f"{self.max_asset_weight:.6f}"
+                )
+
             if not np.isfinite(sharpe) or sharpe <= -1e9:
                 valid = False
                 messages.append("Sharpe ratio is not finite or portfolio risk is near zero")
@@ -1024,7 +1121,7 @@ class SharpeRatioOptimizerEnhanced:
                     valid = False
                     messages.append(f"Return {actual_return:.6f} < min {min_return:.6f}")
                 else:
-                    messages.append(f"✓ Min return satisfied ({actual_return:.6f} ≥ {min_return:.6f})")
+                    messages.append(f"Min return satisfied ({actual_return:.6f} >= {min_return:.6f})")
             
             if max_risk is not None:
                 actual_risk = portfolio_vars['risk']
@@ -1032,20 +1129,17 @@ class SharpeRatioOptimizerEnhanced:
                     valid = False
                     messages.append(f"Risk {actual_risk:.6f} > max {max_risk:.6f}")
                 else:
-                    messages.append(f"✓ Max risk satisfied ({actual_risk:.6f} ≤ {max_risk:.6f})")
+                    messages.append(f"Max risk satisfied ({actual_risk:.6f} <= {max_risk:.6f})")
             
             if verbose:
-                print(f"\n{'='*70}")
-                print(f"Optimization Complete")
-                print(f"{'='*70}")
-                print(f"Optimal Sharpe Ratio: {sharpe:.6f}")
-                print(f"Expected Return: {portfolio_vars['return']:.6f}")
-                print(f"Portfolio Risk: {portfolio_vars['risk']:.6f}")
-                print(f"Elapsed time: {elapsed_time:.4f} seconds")
-                print(f"Status: {'✓ VALID' if valid else '✗ INVALID'}")
+                print("\n--- Optimization Complete ---")
+                print(f"Sharpe       : {sharpe:.6f}")
+                print(f"Return       : {portfolio_vars['return']:.6f}")
+                print(f"Risk         : {portfolio_vars['risk']:.6f}")
+                print(f"Elapsed      : {elapsed_time:.4f}s")
+                print(f"Status       : {'VALID' if valid else 'INVALID'}")
                 for msg in messages:
-                    print(f"  {msg}")
-                print(f"{'='*70}\n")
+                    print(f"  - {msg}")
             
             result = {
                 'weights': weights,
@@ -1068,7 +1162,7 @@ class SharpeRatioOptimizerEnhanced:
         
         except Exception as e:
             if verbose:
-                print(f"\n✗ Optimization failed: {str(e)}")
+                print(f"\nOptimization failed: {str(e)}")
             
             return {
                 'weights': None,
@@ -1142,40 +1236,51 @@ class SharpeRatioOptimizerEnhanced:
 
         portfolios = []
         base_weights = [
-            ("equal_weight", np.ones(self.n_assets) / self.n_assets),
+            ("equal_weight", self._project_to_capped_simplex(np.ones(self.n_assets) / self.n_assets)),
         ]
         for asset_index in range(self.n_assets):
-            single_asset = np.zeros(self.n_assets)
-            single_asset[asset_index] = 1.0
-            base_weights.append((f"single_asset_{asset_index}", single_asset))
+            capped_tilt = np.ones(self.n_assets) * (
+                (1.0 - self.max_asset_weight) / max(self.n_assets - 1, 1)
+            )
+            capped_tilt[asset_index] = self.max_asset_weight
+            base_weights.append((f"capped_tilt_asset_{asset_index}", capped_tilt))
 
         for name, weights in base_weights:
-            variables = self.calculate_variables(weights, mu, sigma)
-            row = {
-                "portfolio_id": len(portfolios),
-                "source": name,
-                "return": variables["return"],
-                "risk": variables["risk"],
-                "sharpe": variables["sharpe"],
-            }
-            for label, weight in zip(self.raw_data_labels, weights):
-                row[f"weight_{label}"] = weight
-            portfolios.append(row)
+            self._add_portfolio_row(portfolios, weights, mu, sigma, name)
 
-        random_count = max(0, n_portfolios - len(portfolios))
-        random_weights = np.random.dirichlet(np.ones(self.n_assets), size=random_count)
-        for weights in random_weights:
-            variables = self.calculate_variables(weights, mu, sigma)
-            row = {
-                "portfolio_id": len(portfolios),
-                "source": "random_simplex",
-                "return": variables["return"],
-                "risk": variables["risk"],
-                "sharpe": variables["sharpe"],
-            }
-            for label, weight in zip(self.raw_data_labels, weights):
-                row[f"weight_{label}"] = weight
-            portfolios.append(row)
+        remaining_count = max(0, n_portfolios - len(portfolios))
+        frontier_count = int(round(remaining_count * 0.60))
+        broad_count = remaining_count - frontier_count
+
+        target_frontier = self.generate_target_return_frontier(
+            n_points=max(25, min(250, frontier_count // 8 if frontier_count else 25)),
+            returns_method=returns_method,
+            lambda_factor=lambda_factor,
+        )
+        if target_frontier.empty:
+            broad_count = remaining_count
+        elif frontier_count > 0:
+            frontier_weight_columns = [f"weight_{label}" for label in self.raw_data_labels]
+            frontier_weights = target_frontier[frontier_weight_columns].to_numpy(dtype=float)
+            frontier_weights = np.array([
+                self._project_to_capped_simplex(weights)
+                for weights in frontier_weights
+            ])
+
+            noise_levels = [0.0, 0.05, 0.10, 0.16, 0.24, 0.32]
+            while len(portfolios) < len(base_weights) + frontier_count:
+                base_weight = frontier_weights[np.random.randint(0, len(frontier_weights))]
+                noise_weight = self._sample_bounded_simplex(1)[0]
+                blend = noise_levels[len(portfolios) % len(noise_levels)]
+                weights = self._project_to_capped_simplex(
+                    (1.0 - blend) * base_weight + blend * noise_weight
+                )
+                source = "frontier_guided" if blend > 0 else "optimized_frontier_anchor"
+                self._add_portfolio_row(portfolios, weights, mu, sigma, source)
+
+        broad_weights = self._sample_bounded_simplex(broad_count)
+        for weights in broad_weights:
+            self._add_portfolio_row(portfolios, weights, mu, sigma, "random_simplex")
 
         frontier_df = pd.DataFrame(portfolios)
         frontier_df = frontier_df.replace([np.inf, -np.inf], np.nan).dropna(
@@ -1222,7 +1327,7 @@ class SharpeRatioOptimizerEnhanced:
                     ),
                 },
             ]
-            x0 = np.ones(self.n_assets) / self.n_assets
+            x0 = self._project_to_capped_simplex(np.ones(self.n_assets) / self.n_assets)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 result = minimize(
@@ -1237,7 +1342,7 @@ class SharpeRatioOptimizerEnhanced:
             if not result.success:
                 continue
 
-            weights = result.x / np.sum(result.x)
+            weights = self._project_to_capped_simplex(result.x)
             variables = self.calculate_variables(weights, mu, sigma)
             row = {
                 "portfolio_id": len(rows),
@@ -1299,7 +1404,7 @@ class SharpeRatioOptimizerEnhanced:
                     ),
                 },
             ]
-            x0 = np.ones(self.n_assets) / self.n_assets
+            x0 = self._project_to_capped_simplex(np.ones(self.n_assets) / self.n_assets)
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
@@ -1307,7 +1412,7 @@ class SharpeRatioOptimizerEnhanced:
                     fun=lambda weights, sigma=sigma: np.dot(weights, np.dot(sigma, weights)),
                     x0=x0,
                     method='SLSQP',
-                    bounds=[(0.0, 1.0)] * self.n_assets,
+                    bounds=self.bounds,
                     constraints=constraints,
                     options={'ftol': 1e-8, 'maxiter': 1000, 'disp': False},
                 )
@@ -1315,7 +1420,7 @@ class SharpeRatioOptimizerEnhanced:
             if not result.success:
                 continue
 
-            weights = result.x / np.sum(result.x)
+            weights = self._project_to_capped_simplex(result.x)
             variables = self.calculate_variables(weights, mu, sigma)
             cleaned_weights = {
                 label: float(0.0 if abs(weight) < weight_threshold else weight)
