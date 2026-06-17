@@ -3,7 +3,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 *.log
-
 # Large data artifacts (broad rules)
 CANDLESTICKS/
 **/FETCH_*/
@@ -13,32 +12,27 @@ CANDLESTICKS/
 **/WEEKLY_OPTIMIZATION_DATA/
 !WEEKLY_OPTIMIZATION_DATA/
 !WEEKLY_OPTIMIZATION_DATA/*.json
-
 # Generated reports/outputs
 **/reports/
 STOCKS/all_stocks_adjusted_returns.xlsx
 Random_vs_Optimal_Chart.html
 .aider*
-
 !nlp-group11.pdf
-
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
-
 node_modules
 dist
 dist-ssr
 *.local
-
 # Editor directories and files
 .vscode/*
-!.vscode/extensions.json
+!/.vscode/extensions.json
 .idea
 .DS_Store
 *.suo
