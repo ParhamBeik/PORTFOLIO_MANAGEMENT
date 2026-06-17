@@ -2161,12 +2161,11 @@
 │   ├── 📁 public/
 │   │   ├── 📁 data/
 │   │   └── 📁 images/
-│   ├── 📁 src/
-│   │   ├── 📁 assets/
-│   │   ├── 📁 components/
-│   │   ├── 📁 hooks/
-│   │   └── 📁 utils/
-│   └── 📄 project_structure copy.py
+│   └── 📁 src/
+│       ├── 📁 assets/
+│       ├── 📁 components/
+│       ├── 📁 hooks/
+│       └── 📁 utils/
 └── 📁 scripts/
     ├── 📄 build_weekly_optimization_data.py
     ├── 📄 example_usage.py
