@@ -7,7 +7,6 @@ __pycache__/
 # Large data artifacts (broad rules)
 CANDLESTICKS/
 **/FETCH_*/
-**/data/
 **/daily/
 **/weekly/
 **/monthly/
@@ -17,8 +16,6 @@ CANDLESTICKS/
 
 # Generated reports/outputs
 **/reports/
-!optimization_results/
-!optimization_results/*.json
 STOCKS/all_stocks_adjusted_returns.xlsx
 Random_vs_Optimal_Chart.html
 .aider*
