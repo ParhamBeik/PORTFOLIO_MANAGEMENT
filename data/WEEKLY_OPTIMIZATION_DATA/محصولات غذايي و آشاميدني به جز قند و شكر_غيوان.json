@@ -1,0 +1,41 @@
+{
+  "ticker": "غيوان",
+  "industry": "محصولات غذايي و آشاميدني به جز قند و شكر",
+  "timeframe": "1W",
+  "metadata": {
+    "return_type": "log_return",
+    "calendar": "jalali"
+  },
+  "metrics": {
+    "annualized_expected_return": null,
+    "annualized_volatility": null,
+    "coverage": {
+      "weeks_available": 1,
+      "first_week": "1404-08-03",
+      "last_week": "1404-08-03"
+    },
+    "liquidity": {
+      "average_weekly_volume": 49689.0,
+      "average_weekly_trade_value_toman": 144098100.0,
+      "median_weekly_trade_value_toman": 144098100.0
+    },
+    "risk": {
+      "max_drawdown": 0.0
+    }
+  },
+  "data": [
+    {
+      "week_start_date": "1404-08-03",
+      "week_end_date": "1404-08-07",
+      "open": 0.0,
+      "high": 0.0,
+      "low": 0.0,
+      "close": 29000.0,
+      "weekly_volume": 49689.0,
+      "weekly_trade_value_toman": 144098100.0,
+      "simple_return": null,
+      "log_return": null,
+      "rolling_26w_volatility": null
+    }
+  ]
+}
