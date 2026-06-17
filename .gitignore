@@ -1,10 +1,16 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
-.DS_Store
-*.log
 
-# Large data artifacts (broad rules)
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Large data artifacts
 CANDLESTICKS/
 **/FETCH_*/
 **/daily/
@@ -20,39 +26,31 @@ STOCKS/all_stocks_adjusted_returns.xlsx
 Random_vs_Optimal_Chart.html
 .aider*
 
+# Keep this file tracked
 !nlp-group11.pdf
 
-# Frontend-specific ignores
+# Frontend build artifacts
 node_modules/
 dist/
 build/
+dist-ssr/
+*.local
+
+# Temporary tooling folders
 .agents/
 .codex/
 .vite/
 .cache/
 .tmp/
+
+# Environment files
 .env
 .env.*
 
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
 # Editor directories and files
-.vscode/*
+.vscode/
 !.vscode/extensions.json
-.idea
-.DS_Store
+.idea/
 *.suo
 *.ntvs*
 *.njsproj
