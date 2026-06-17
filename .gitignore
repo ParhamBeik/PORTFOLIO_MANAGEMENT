@@ -21,3 +21,15 @@ Random_vs_Optimal_Chart.html
 .aider*
 
 !nlp-group11.pdf
+
+# Frontend-specific ignores
+node_modules/
+dist/
+build/
+.agents/
+.codex/
+.vite/
+.cache/
+.tmp/
+.env
+.env.*
