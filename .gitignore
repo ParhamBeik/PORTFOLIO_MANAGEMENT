@@ -20,3 +20,4 @@ CANDLESTICKS/
 !optimization_results/
 !optimization_results/*.json
 STOCKS/all_stocks_adjusted_returns.xlsx
+Random_vs_Optimal_Chart.html
